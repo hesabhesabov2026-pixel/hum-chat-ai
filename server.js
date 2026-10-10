@@ -1,25 +1,19 @@
-
-const express = require("express");
-const path = require("path");
-
+const express = require('express');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(express.json());
-app.use(express.static(__dirname));
 
-app.get("/api/status", (req, res) => {
-  res.json({
-    success: true,
-    message: "Hum Chat AI serveri işləyir!"
-  });
+// Əsas səhifə
+app.get('/', (req, res) => {
+  res.send('Hum Chat AI Server işləyir!');
 });
 
-app.get("*", (req, res) => {
-  res.sendFile(path.join(__dirname, "index.html"));
+// Bütün digər tapılmayan route-lar üçün (Express 5 uyğun)
+app.use((req, res) => {
+  res.status(404).send('Səhifə tapılmadı');
 });
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Hum Chat AI serveri ${PORT} portunda işləyir.`);
+app.listen(PORT, () => {
+  console.log(`Server ${PORT} portunda çalışır`);
 });
-
