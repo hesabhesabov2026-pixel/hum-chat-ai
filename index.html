@@ -28,6 +28,7 @@ body {
   height: 100vh;
   height: 100dvh;
   overflow: hidden;
+  overscroll-behavior-y: none; /* Səhifənin yuxarıdan aşağı dartılıb yenilənməsini dayandırır */
 }
 
 button {
@@ -124,6 +125,7 @@ button:focus-visible {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
+  overscroll-behavior-y: contain; /* Siyahının yenilənməni tetiklemesinin qarşısını alır */
 }
 
 .conversation {
@@ -284,6 +286,7 @@ header {
   flex-direction: column;
   gap: 22px;
   scroll-behavior: smooth;
+  overscroll-behavior-y: contain; /* Çat pəncərəsində səhifənin yenilənməsini bloklayır */
 }
 
 .welcome {
@@ -1295,4 +1298,4 @@ function initialize() {
 initialize();
 </script>
 </body>
-      </html>
+</html>
