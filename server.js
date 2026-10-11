@@ -1,93 +1,128 @@
 
 const express = require("express");
 const path = require("path");
-const multer = require("multer");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// JSON mesajları üçün
-app.use(express.json({ limit: "50mb" }));
-
-// Şəkil yükləmə sistemi
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: {
-    fileSize: 10 * 1024 * 1024, // Maksimum 10 MB
-    files: 1
-  },
-  fileFilter: (req, file, cb) => {
-    const allowedTypes = [
-      "image/jpeg",
-      "image/png",
-      "image/webp",
-      "image/gif"
-    ];
-
-    if (allowedTypes.includes(file.mimetype)) {
-      cb(null, true);
-    } else {
-      cb(new Error("Yalnız JPG, PNG, WEBP və GIF şəkilləri qəbul olunur."));
-    }
-  }
-});
-
-// HTML, CSS və digər statik fayllar
+app.use(express.json({ limit: "15mb" }));
 app.use(express.static(__dirname));
 
 const SYSTEM_PROMPT =
   "Sən Hüm Chat AI adlı mehriban və ağıllı köməkçisən. " +
   "Azərbaycan dilində aydın, dəqiq, faydalı və səmimi cavab ver. " +
-  "Şəkilləri təhlil edərkən gördüklərini diqqətlə izah et. " +
-  "Əvvəlki mesajları nəzərə al və eyni söhbətdə verilən suallara uyğun cavab ver. " +
-  "İstifadəçinin əvvəlki mesajlarını yeni faktlarla qarışdırma.";
+  "Şəkilləri diqqətlə təhlil et və gördüklərini izah et. " +
+  "Əvvəlki mesajları nəzərə al və söhbətin məntiqi davamını qoru. " +
+  "Əvvəlki mesajlarda olmayan məlumatları uydurma.";
 
-// Ehtiyat modellər
+// Əvvəlcə bu modellər yoxlanılır.
+// Server yalnız API-də mövcud olanları seçir.
+const PREFERRED_MODELS = [
+  "gemini-2.5-flash",
+  "gemini-2.5-flash-lite",
+  "gemini-2.0-flash",
+  "gemini-2.0-flash-lite",
+  "gemini-1.5-flash",
+  "gemini-1.5-pro",
+  "gemini-1.5-flash-8b",
+  "gemini-pro"
+];
+
+const MAX_MODEL_ATTEMPTS = 6;
+const MODEL_CACHE_TTL = 5 * 60 * 1000;
+
+let modelCache = {
+  models: [],
+  expiresAt: 0
+};
+
+let modelsRequestPromise = null;
+
 function getFallbackModels() {
-  return [
-    "gemini-2.0-flash",
-    "gemini-1.5-flash",
-    "gemini-1.5-pro",
-    "gemini-1.5-flash-8b",
-    "gemini-2.0-flash-lite",
-    "gemini-pro"
-  ];
+  return [...PREFERRED_MODELS];
 }
 
-// Gemini API-dən mövcud modelləri al
+// Gemini modellərinin siyahısını keşlə al
 async function getModels(apiKey) {
-  try {
-    const response = await fetch(
-      "https://generativelanguage.googleapis.com/v1beta/models",
-      {
-        headers: {
-          "x-goog-api-key": apiKey
-        },
-        signal: AbortSignal.timeout(15000)
-      }
-    );
-
-    const data = await response.json();
-
-    if (!response.ok) {
-      console.error("Model siyahısı xətası:", data.error?.message);
-      return getFallbackModels();
-    }
-
-    const models = (data.models || [])
-      .filter(model =>
-        model.supportedGenerationMethods?.includes("generateContent")
-      )
-      .map(model => model.name.replace(/^models\//, ""));
-
-    return models.length ? models : getFallbackModels();
-  } catch (error) {
-    console.error("Model siyahısını almaq olmadı:", error.message);
-    return getFallbackModels();
+  if (
+    modelCache.models.length &&
+    Date.now() < modelCache.expiresAt
+  ) {
+    return modelCache.models;
   }
+
+  // Eyni anda gələn sorğular təkrar model siyahısı istəməsin
+  if (modelsRequestPromise) {
+    return modelsRequestPromise;
+  }
+
+  modelsRequestPromise = (async () => {
+    try {
+      const response = await fetch(
+        "https://generativelanguage.googleapis.com/v1beta/models",
+        {
+          headers: {
+            "x-goog-api-key": apiKey
+          },
+          signal: AbortSignal.timeout(10000)
+        }
+      );
+
+      const data = await response.json().catch(() => ({}));
+
+      if (!response.ok) {
+        console.error(
+          "Model siyahısı xətası:",
+          response.status,
+          data.error?.message || ""
+        );
+
+        // API açarı səhvdirsə ehtiyat modellərə keçmək faydasızdır
+        if ([400, 401, 403].includes(response.status)) {
+          return [];
+        }
+
+        return getFallbackModels();
+      }
+
+      const models = (data.models || [])
+        .filter(model =>
+          model.supportedGenerationMethods?.includes(
+            "generateContent"
+          )
+        )
+        .map(model =>
+          model.name.replace(/^models\//, "")
+        );
+
+      const uniqueModels = [...new Set(models)];
+
+      if (!uniqueModels.length) {
+        return getFallbackModels();
+      }
+
+      modelCache = {
+        models: uniqueModels,
+        expiresAt: Date.now() + MODEL_CACHE_TTL
+      };
+
+      return uniqueModels;
+    } catch (error) {
+      console.error(
+        "Model siyahısını almaq olmadı:",
+        error.message
+      );
+
+      return getFallbackModels();
+    } finally {
+      modelsRequestPromise = null;
+    }
+  })();
+
+  return modelsRequestPromise;
 }
 
-// Server statusu
+// Status
 app.get("/api/status", (req, res) => {
   res.json({
     success: true,
@@ -107,6 +142,12 @@ app.get("/api/models", async (req, res) => {
 
   const models = await getModels(apiKey);
 
+  if (!models.length) {
+    return res.status(502).json({
+      error: "Modellərin siyahısını almaq olmadı."
+    });
+  }
+
   res.json({
     success: true,
     count: models.length,
@@ -114,32 +155,19 @@ app.get("/api/models", async (req, res) => {
   });
 });
 
-// AI söhbəti: mətn + şəkil + əvvəlki mesajlar
-app.post("/api/chat", upload.single("image"), async (req, res) => {
+// AI söhbəti: mətn, şəkil, tarixçə və avtomatik model keçidi
+app.post("/api/chat", async (req, res) => {
   try {
+    const body = req.body || {};
+
     const message =
-      typeof req.body.message === "string"
-        ? req.body.message
+      typeof body.message === "string"
+        ? body.message
         : "";
 
-    let history = req.body.history;
-    let image = req.body.image || null;
-    let mimeType = req.body.mimeType || null;
-
-    // FormData ilə göndərilən şəkli base64 formatına çevir
-    if (req.file) {
-      image = req.file.buffer.toString("base64");
-      mimeType = req.file.mimetype;
-    }
-
-    // FormData-da history mətn kimi gələ bilər
-    if (typeof history === "string") {
-      try {
-        history = JSON.parse(history);
-      } catch {
-        history = [];
-      }
-    }
+    let image = body.image || null;
+    let mimeType = body.mimeType || null;
+    const history = body.history;
 
     if (!message.trim() && !image) {
       return res.status(400).json({
@@ -155,34 +183,23 @@ app.post("/api/chat", upload.single("image"), async (req, res) => {
       });
     }
 
-    // Əvvəlki mesajları yoxla
-    const safeHistory = Array.isArray(history)
-      ? history
-          .filter(item =>
-            item &&
-            ["user", "model"].includes(item.role) &&
-            typeof item.text === "string" &&
-            item.text.trim().length > 0
-          )
-          .slice(-20)
-          .map(item => ({
-            role: item.role,
-            parts: [
-              { text: item.text.slice(0, 12000) }
-            ]
-          }))
-      : [];
+    // Data URL göndərilərsə base64 hissəsini ayır
+    if (typeof image === "string" && image.startsWith("data:")) {
+      const match = image.match(
+        /^data:(image\/[a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=]+)$/
+      );
 
-    // Cari mesajın hissələri
-    const currentParts = [];
+      if (!match) {
+        return res.status(400).json({
+          error: "Şəklin formatı düzgün deyil."
+        });
+      }
 
-    if (message.trim()) {
-      currentParts.push({
-        text: message.trim()
-      });
+      mimeType = mimeType || match[1];
+      image = match[2];
     }
 
-    // Şəkli yoxla
+    // Şəkil yoxlamaları
     if (image) {
       const allowedTypes = [
         "image/jpeg",
@@ -196,32 +213,76 @@ app.post("/api/chat", upload.single("image"), async (req, res) => {
         !allowedTypes.includes(mimeType)
       ) {
         return res.status(400).json({
-          error: "Yalnız JPG, PNG, WEBP və GIF şəkilləri qəbul olunur."
+          error: "Yalnız JPG, PNG, WEBP və GIF qəbul olunur."
         });
       }
 
-      // Data URL göndərilibsə, yalnız base64 hissəsini götür
-      const base64Image = image.replace(
-        /^data:image\/[a-zA-Z0-9.+-]+;base64,/,
-        ""
-      );
+      if (
+        image.length === 0 ||
+        !/^[A-Za-z0-9+/]*={0,2}$/.test(image) ||
+        image.length % 4 !== 0
+      ) {
+        return res.status(400).json({
+          error: "Şəkil məlumatı düzgün deyil."
+        });
+      }
 
+      const imageBytes = Buffer.from(image, "base64");
+
+      if (
+        imageBytes.length === 0 ||
+        imageBytes.length > 8 * 1024 * 1024
+      ) {
+        return res.status(413).json({
+          error: "Şəkil 8 MB-dan böyük ola bilməz."
+        });
+      }
+    }
+
+    // Tarixçəni təhlükəsiz şəkildə hazırla
+    const safeHistory = Array.isArray(history)
+      ? history
+          .filter(item =>
+            item &&
+            ["user", "model"].includes(item.role) &&
+            typeof item.text === "string" &&
+            item.text.trim().length > 0
+          )
+          .slice(-20)
+          .map(item => ({
+            role: item.role,
+            parts: [
+              {
+                text: item.text.slice(0, 12000)
+              }
+            ]
+          }))
+      : [];
+
+    const currentParts = [];
+
+    if (message.trim()) {
+      currentParts.push({
+        text: message.trim()
+      });
+    }
+
+    if (image) {
       currentParts.push({
         inline_data: {
           mime_type: mimeType,
-          data: base64Image
+          data: image
         }
       });
     }
 
-    // İstifadəçi yalnız şəkil göndəribsə
     if (!message.trim() && image) {
-      currentParts.unshift({
-        text: "Bu şəkli diqqətlə təhlil et və gördüklərini Azərbaycan dilində izah et."
+      currentParts.push({
+        text:
+          "Bu şəkli diqqətlə təhlil et və gördüklərini Azərbaycan dilində izah et."
       });
     }
 
-    // Tarixçə və cari mesaj
     const contents = [
       ...safeHistory,
       {
@@ -230,31 +291,33 @@ app.post("/api/chat", upload.single("image"), async (req, res) => {
       }
     ];
 
+    // Modellər keşdən alınır
     const availableModels = await getModels(apiKey);
 
-    const preferredModels = [
-      "gemini-3.8-flash",
-      "gemini-2.0-flash",
-      "gemini-1.5-flash",
-      "gemini-1.5-pro",
-      "gemini-1.5-flash-8b",
-      "gemini-2.0-flash-lite"
-    ];
+    if (!availableModels.length) {
+      return res.status(502).json({
+        error:
+          "Gemini API açarını və API icazələrini yoxla."
+      });
+    }
 
+    // Mövcud modelləri prioritet sırası ilə düz
     const modelList = [
-      ...preferredModels.filter(model =>
+      ...PREFERRED_MODELS.filter(model =>
         availableModels.includes(model)
       ),
       ...availableModels.filter(model =>
-        !preferredModels.includes(model)
+        !PREFERRED_MODELS.includes(model)
       )
-    ];
+    ].slice(0, MAX_MODEL_ATTEMPTS);
 
     let lastStatus = 502;
     let lastError = "";
 
-    // Mövcud modelləri növbə ilə yoxla
-    for (const model of [...new Set(modelList)]) {
+    // Avtomatik ehtiyat modelə keçid
+    for (const model of modelList) {
+      console.log("Yoxlanılan model:", model);
+
       try {
         const response = await fetch(
           `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
@@ -266,7 +329,11 @@ app.post("/api/chat", upload.single("image"), async (req, res) => {
             },
             body: JSON.stringify({
               systemInstruction: {
-                parts: [{ text: SYSTEM_PROMPT }]
+                parts: [
+                  {
+                    text: SYSTEM_PROMPT
+                  }
+                ]
               },
               contents,
               generationConfig: {
@@ -274,22 +341,31 @@ app.post("/api/chat", upload.single("image"), async (req, res) => {
                 maxOutputTokens: 4096
               }
             }),
-            signal: AbortSignal.timeout(35000)
+            signal: AbortSignal.timeout(25000)
           }
         );
 
-        const data = await response.json();
+        const data = await response.json().catch(() => ({}));
 
         if (!response.ok) {
           lastStatus = response.status;
-          lastError = data.error?.message || "";
+          lastError = data.error?.message || "Naməlum API xətası";
 
           console.error(
-            `Model ${model} xətası:`,
+            `Model ${model}:`,
             response.status,
             lastError
           );
 
+          // Açar və icazə xətalarında başqa modeli yoxlama
+          if ([401, 403].includes(response.status)) {
+            return res.status(502).json({
+              error:
+                "Gemini API açarı və ya icazələri ilə bağlı xəta var."
+            });
+          }
+
+          // Digər xətalarda növbəti modelə keç
           continue;
         }
 
@@ -299,6 +375,8 @@ app.post("/api/chat", upload.single("image"), async (req, res) => {
           .trim();
 
         if (answer) {
+          console.log("Cavab verən model:", model);
+
           return res.json({
             success: true,
             answer,
@@ -306,17 +384,28 @@ app.post("/api/chat", upload.single("image"), async (req, res) => {
           });
         }
 
-        lastError = "Model boş cavab qaytardı.";
+        lastError =
+          data.promptFeedback?.blockReason ||
+          data.candidates?.[0]?.finishReason ||
+          "Model boş cavab qaytardı.";
+
       } catch (error) {
         lastError = error.message;
-        console.error(`Model ${model}:`, error.message);
+
+        console.error(
+          `Model ${model} xətası:`,
+          error.message
+        );
+
+        // Şəbəkə və vaxt aşımı xətalarında növbəti modelə keç
       }
     }
 
     console.error("Bütün modellər uğursuz oldu:", lastError);
 
     return res.status(502).json({
-      error: "AI cavab vermədi. API açarını, modelləri və limitləri yoxla.",
+      error:
+        "AI cavab verə bilmədi. Bir az sonra yenidən yoxla və ya API limitlərini yoxla.",
       status: lastStatus
     });
 
@@ -329,27 +418,25 @@ app.post("/api/chat", upload.single("image"), async (req, res) => {
   }
 });
 
-// Şəkil yükləmə və digər middleware xətaları
+// JSON ölçü və format xətaları
 app.use((err, req, res, next) => {
-  if (err instanceof multer.MulterError) {
-    if (err.code === "LIMIT_FILE_SIZE") {
-      return res.status(413).json({
-        error: "Şəkil çox böyükdür. Maksimum ölçü 10 MB-dır."
-      });
-    }
-
-    return res.status(400).json({
-      error: "Şəkil yüklənərkən xəta baş verdi."
+  if (err.type === "entity.too.large") {
+    return res.status(413).json({
+      error: "Sorğu çox böyükdür. Daha kiçik şəkil göndər."
     });
   }
 
-  if (err) {
+  if (err instanceof SyntaxError && err.status === 400) {
     return res.status(400).json({
-      error: err.message || "Sorğu emal edilə bilmədi."
+      error: "Göndərilən JSON məlumatı düzgün deyil."
     });
   }
 
-  next();
+  console.error("Middleware xətası:", err);
+
+  return res.status(500).json({
+    error: "Serverdə xəta baş verdi."
+  });
 });
 
 // Əsas səhifə
@@ -357,7 +444,7 @@ app.get("/", (req, res) => {
   res.sendFile(path.join(__dirname, "index.html"));
 });
 
-// Serveri başladır
+// Serveri başlat
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Hüm Chat AI ${PORT} portunda işləyir.`);
 });
