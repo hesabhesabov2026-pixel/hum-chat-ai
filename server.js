@@ -1,17 +1,44 @@
 
 const express = require("express");
 const path = require("path");
+const multer = require("multer");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// JSON mesajları üçün
 app.use(express.json({ limit: "50mb" }));
+
+// Şəkil yükləmə sistemi
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 10 * 1024 * 1024, // Maksimum 10 MB
+    files: 1
+  },
+  fileFilter: (req, file, cb) => {
+    const allowedTypes = [
+      "image/jpeg",
+      "image/png",
+      "image/webp",
+      "image/gif"
+    ];
+
+    if (allowedTypes.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error("Yalnız JPG, PNG, WEBP və GIF şəkilləri qəbul olunur."));
+    }
+  }
+});
+
+// HTML, CSS və digər statik fayllar
 app.use(express.static(__dirname));
 
 const SYSTEM_PROMPT =
   "Sən Hüm Chat AI adlı mehriban və ağıllı köməkçisən. " +
   "Azərbaycan dilində aydın, dəqiq, faydalı və səmimi cavab ver. " +
-  "Şəkilləri təhlil edərkən detallı izah et. " +
+  "Şəkilləri təhlil edərkən gördüklərini diqqətlə izah et. " +
   "Əvvəlki mesajları nəzərə al və eyni söhbətdə verilən suallara uyğun cavab ver. " +
   "İstifadəçinin əvvəlki mesajlarını yeni faktlarla qarışdırma.";
 
@@ -33,7 +60,9 @@ async function getModels(apiKey) {
     const response = await fetch(
       "https://generativelanguage.googleapis.com/v1beta/models",
       {
-        headers: { "x-goog-api-key": apiKey },
+        headers: {
+          "x-goog-api-key": apiKey
+        },
         signal: AbortSignal.timeout(15000)
       }
     );
@@ -85,20 +114,34 @@ app.get("/api/models", async (req, res) => {
   });
 });
 
-// Yeni söhbət yaddaşı dəstəyi ilə AI
-app.post("/api/chat", async (req, res) => {
+// AI söhbəti: mətn + şəkil + əvvəlki mesajlar
+app.post("/api/chat", upload.single("image"), async (req, res) => {
   try {
-    const {
-      message,
-      image,
-      mimeType,
-      history
-    } = req.body || {};
+    const message =
+      typeof req.body.message === "string"
+        ? req.body.message
+        : "";
 
-    if (
-      typeof message !== "string" ||
-      (!message.trim() && !image)
-    ) {
+    let history = req.body.history;
+    let image = req.body.image || null;
+    let mimeType = req.body.mimeType || null;
+
+    // FormData ilə göndərilən şəkli base64 formatına çevir
+    if (req.file) {
+      image = req.file.buffer.toString("base64");
+      mimeType = req.file.mimetype;
+    }
+
+    // FormData-da history mətn kimi gələ bilər
+    if (typeof history === "string") {
+      try {
+        history = JSON.parse(history);
+      } catch {
+        history = [];
+      }
+    }
+
+    if (!message.trim() && !image) {
       return res.status(400).json({
         error: "Mesaj yazın və ya şəkil göndərin."
       });
@@ -112,8 +155,7 @@ app.post("/api/chat", async (req, res) => {
       });
     }
 
-    // Əvvəlki yazışmaları yoxla.
-    // history yalnız əvvəlki mesajları ehtiva etməlidir.
+    // Əvvəlki mesajları yoxla
     const safeHistory = Array.isArray(history)
       ? history
           .filter(item =>
@@ -125,7 +167,9 @@ app.post("/api/chat", async (req, res) => {
           .slice(-20)
           .map(item => ({
             role: item.role,
-            parts: [{ text: item.text.slice(0, 12000) }]
+            parts: [
+              { text: item.text.slice(0, 12000) }
+            ]
           }))
       : [];
 
@@ -138,7 +182,7 @@ app.post("/api/chat", async (req, res) => {
       });
     }
 
-    // Şəkil yoxlanışı
+    // Şəkli yoxla
     if (image) {
       const allowedTypes = [
         "image/jpeg",
@@ -156,22 +200,28 @@ app.post("/api/chat", async (req, res) => {
         });
       }
 
+      // Data URL göndərilibsə, yalnız base64 hissəsini götür
+      const base64Image = image.replace(
+        /^data:image\/[a-zA-Z0-9.+-]+;base64,/,
+        ""
+      );
+
       currentParts.push({
         inline_data: {
           mime_type: mimeType,
-          data: image
+          data: base64Image
         }
       });
     }
 
-    // Şəkil tək göndəriləndə
+    // İstifadəçi yalnız şəkil göndəribsə
     if (!message.trim() && image) {
       currentParts.unshift({
         text: "Bu şəkli diqqətlə təhlil et və gördüklərini Azərbaycan dilində izah et."
       });
     }
 
-    // Tarixçə + cari mesaj
+    // Tarixçə və cari mesaj
     const contents = [
       ...safeHistory,
       {
@@ -203,6 +253,7 @@ app.post("/api/chat", async (req, res) => {
     let lastStatus = 502;
     let lastError = "";
 
+    // Mövcud modelləri növbə ilə yoxla
     for (const model of [...new Set(modelList)]) {
       try {
         const response = await fetch(
@@ -262,8 +313,10 @@ app.post("/api/chat", async (req, res) => {
       }
     }
 
+    console.error("Bütün modellər uğursuz oldu:", lastError);
+
     return res.status(502).json({
-      error: "AI cavab vermədi. API açarını, model siyahısını və limitləri yoxla.",
+      error: "AI cavab vermədi. API açarını, modelləri və limitləri yoxla.",
       status: lastStatus
     });
 
@@ -276,11 +329,35 @@ app.post("/api/chat", async (req, res) => {
   }
 });
 
+// Şəkil yükləmə və digər middleware xətaları
+app.use((err, req, res, next) => {
+  if (err instanceof multer.MulterError) {
+    if (err.code === "LIMIT_FILE_SIZE") {
+      return res.status(413).json({
+        error: "Şəkil çox böyükdür. Maksimum ölçü 10 MB-dır."
+      });
+    }
+
+    return res.status(400).json({
+      error: "Şəkil yüklənərkən xəta baş verdi."
+    });
+  }
+
+  if (err) {
+    return res.status(400).json({
+      error: err.message || "Sorğu emal edilə bilmədi."
+    });
+  }
+
+  next();
+});
+
 // Əsas səhifə
 app.get("/", (req, res) => {
   res.sendFile(path.join(__dirname, "index.html"));
 });
 
+// Serveri başladır
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Hüm Chat AI ${PORT} portunda işləyir.`);
 });
